@@ -153,6 +153,8 @@ import gc
 from PIL import Image
 
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from .video import ImagesToDiskTensor, DiskTensorMerge, DiskTensorToVideo, DiskTensorToImages
+
 
 # ---- helpers ----
 
@@ -1090,6 +1092,11 @@ NODE_CLASS_MAPPINGS = {
     "VideoSceneExtractorSeek": VideoSceneExtractorSeek,
     "Qwen2VLLoader": Qwen2VLLoader,
     "Qwen2VLCaption": Qwen2VLCaption,
+    "ImagesToDiskTensor": ImagesToDiskTensor,
+    "DiskTensorMerge": DiskTensorMerge,
+    "DiskTensorToVideo": DiskTensorToVideo,
+    "DiskTensorToImages": DiskTensorToImages,
+
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1099,4 +1106,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoSceneExtractorSeek": "Video Scene Extractor (Seek)",
     "Qwen2VLLoader": "Qwen2-VL Loader",
     "Qwen2VLCaption": "Qwen2-VL Caption (Image/Video)",
+    "ImagesToDiskTensor": "Images → Disk Tensor",
+    "DiskTensorMerge": "Disk Tensor Merge (Stitch)",
+    "DiskTensorToVideo": "Disk Tensor → Video",
+    "DiskTensorToImages": "Disk Tensor → Images",
 }
