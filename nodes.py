@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+from .latent import LatentToDiskCache, DiskLatentConcat, DiskLatentLoad
+
 """
 ComfyUI Nodes Pack — Video Tools & Qwen2-VL
 
@@ -1096,6 +1099,9 @@ NODE_CLASS_MAPPINGS = {
     "DiskTensorMerge": DiskTensorMerge,
     "DiskTensorToVideo": DiskTensorToVideo,
     "DiskTensorToImages": DiskTensorToImages,
+    "LatentToDiskCache": LatentToDiskCache,
+    "DiskLatentConcat": DiskLatentConcat,
+    "DiskLatentLoad": DiskLatentLoad,
 
 }
 
@@ -1110,4 +1116,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DiskTensorMerge": "Disk Tensor Merge (Stitch)",
     "DiskTensorToVideo": "Disk Tensor → Video",
     "DiskTensorToImages": "Disk Tensor → Images",
+    "LatentToDiskCache": "Latent → Disk Cache",
+    "DiskLatentConcat": "Disk Latent Concat (Stitch)",
+    "DiskLatentLoad": "Disk Latent → Load",
 }
