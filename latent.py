@@ -134,12 +134,23 @@ def _chunk_slices(length: int, dim: int, max_chunk_elems: int, shape: Tuple[int,
         start = end
     return slices
 
+def _save_tensor_chunks(
+    t: torch.Tensor,
+    base_dir: Path,
+    field: str,
+    dim: int,
+    max_chunk_elems: int,
+) -> List[Dict[str, Any]]:
+    """
+    Save tensor `t` in chunks along dimension `dim` without offloading the whole tensor to CPU.
+    Each chunk is sliced on the original device, copied to CPU, saved, and then freed
+    to minimize host RAM usage.
 
-def _save_tensor_chunks(t: torch.Tensor, base_dir: Path, field: str, dim: int, max_chunk_elems: int) -> List[Dict[str, Any]]:
+    Returns a list of chunk metadata dicts.
     """
-    Save tensor `t` in chunks along dimension `dim`. Returns a list of chunk metadata dicts.
-    """
-    t = _to_cpu_detach(t).contiguous()
+    # Detach to avoid autograd refs; keep original device (no full CPU copy!)
+    t = t.detach()
+
     base = base_dir / field
     base.mkdir(parents=True, exist_ok=True)
 
@@ -151,15 +162,37 @@ def _save_tensor_chunks(t: torch.Tensor, base_dir: Path, field: str, dim: int, m
         # Build full slicing tuple
         st = [slice(None)] * t.ndim
         st[dim] = sl
-        chunk = t[tuple(st)].contiguous()  # (chunk_len, ...)
+
+        # Slice on the original device (GPU or CPU)
+        dev_chunk = t[tuple(st)]
+
+        # Move JUST this slice to CPU, then make it contiguous for safe serialization
+        chunk_cpu = dev_chunk.detach().to("cpu", copy=True).contiguous()
+        # Release the device view ASAP
+        del dev_chunk
+
+        # If the source is CUDA, make sure the host copy finished before proceeding
+        if t.is_cuda:
+            torch.cuda.synchronize()
+
+        # Save to disk
         fname = base / f"{idx:06d}.pt"
-        torch.save(chunk, fname)
+        torch.save(chunk_cpu, fname)
+
         parts.append({
             "file": os.path.relpath(fname, start=base_dir),
             "slice": [sl.start, sl.stop],
-            "shape": list(chunk.shape),
+            "shape": list(chunk_cpu.shape),
         })
-        del chunk
+
+        # Free host memory for the just-saved chunk
+        del chunk_cpu
+        gc.collect()  # encourage immediate host RAM reclamation
+
+        # Optionally trim CUDA cache to reduce GPU mem pressure (harmless if not CUDA)
+        if t.is_cuda:
+            torch.cuda.empty_cache()
+
     return parts
 
 
