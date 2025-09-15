@@ -1,6 +1,93 @@
 from __future__ import annotations
+import torch.nn.functional as F
+import os
+import gc
+import json
+import struct
+import zlib
+import torch
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from typing import List, Tuple, Dict, Any, Optional
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+import folder_paths
+from comfy.cli_args import args
 
 from .latent import LatentToDiskCache, DiskLatentConcat, DiskLatentLoad
+from .video import ImagesToDiskTensor, DiskTensorMerge, DiskTensorToVideo, DiskTensorToImages
+
+
+try:
+    from comfy.cli_args import args as comfy_args
+    MAX_RESOLUTION = getattr(comfy_args, "max_resolution", 8192)
+except Exception:
+    MAX_RESOLUTION = 8192
+
+
+def _ensure_bchw(img):
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
+    return img.movedim(-1, 1).contiguous()  # [B,C,H,W]
+
+
+def _ensure_bhw(mask):
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+    return mask.contiguous()                # [B,H,W]
+
+
+def _odd(k: int) -> int:
+    k = int(k)
+    return k if (k % 2 == 1) else (k + 1)
+
+
+def _gauss_kernel(ks: int, sigma: float, device, dtype):
+    c = (ks - 1) / 2.0
+    x = torch.arange(ks, device=device, dtype=dtype) - c
+    g = torch.exp(-(x * x) / (2 * sigma * sigma))
+    g = g / g.sum()
+    return g
+
+
+def _gaussian_blur_2d(x, k: int):
+    # x: [B,1,H,W] or [B,C,H,W]
+    k = _odd(max(1, int(k)))
+    if k <= 1:
+        return x
+    sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
+    g = _gauss_kernel(k, sigma, x.device, x.dtype)
+    g1 = g.view(1, 1, 1, k)
+    g2 = g.view(1, 1, k, 1)
+    pad = (k // 2, k // 2, k // 2, k // 2)
+    c = x.shape[1]
+    y = F.conv2d(F.pad(x, pad, mode="reflect"), g1.expand(c, -1, -1, -1), groups=c)
+    y = F.conv2d(F.pad(y, pad, mode="reflect"), g2.expand(c, -1, -1, -1), groups=c)
+    return y
+
+
+def _dilate(m01, k: int):
+    if k <= 0:
+        return m01
+    pad = k // 2
+    return F.max_pool2d(F.pad(m01, (pad, pad, pad, pad), mode="replicate"), k, stride=1)
+
+
+def _erode(m01, k: int):
+    if k <= 0:
+        return m01
+    inv = 1.0 - m01
+    return 1.0 - _dilate(inv, k)
+
+
+def _resize_mask_to(mask_b1hw, size_hw):
+    # bilinear + clamp for mask
+    return F.interpolate(mask_b1hw, size=size_hw, mode="bilinear", align_corners=False).clamp(0, 1)
 
 """
 ComfyUI Nodes Pack — Video Tools & Qwen2-VL
@@ -141,22 +228,7 @@ Requirements
 - All nodes assume RGB images and preserve value range [0,1].
 """
 
-import json
-from typing import List, Tuple, Dict, Any, Optional
 
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
-import torch
-import torch.nn.functional as F
-
-import gc
-from PIL import Image
-
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-from .video import ImagesToDiskTensor, DiskTensorMerge, DiskTensorToVideo, DiskTensorToImages
 
 
 # ---- helpers ----
@@ -1085,10 +1157,371 @@ class VideoSceneExtractorSeek:
 
         return (images, json.dumps(det_meta))
 
+# Single-node replacement for:
+#   InvertMask -> ImageCompositeMasked -> MaskFix -> Join Image with Alpha
+#
+# Behavior details matched to originals:
+# - Uses the *incoming* mask directly for the composite pass (this is the already-inverted mask in your graph).
+# - Applies MaskFix ops (erode/dilate, fill_holes, opening, smooth, blur) to that same mask afterwards.
+# - Joins alpha as: alpha = 1 - resized_fixed_mask  (same as Join Image with Alpha).
+# - Output image is RGBA built from the *composited* image's RGB + the computed alpha (like the original chain).
+#
+# Notes:
+# - Morphological ops implemented with torch (pooling + separable Gaussian) to keep things fast.
+# - Composite behavior matches ImageCompositeMasked: optional resize_source, x/y placement otherwise.
+# - Shapes: IMAGE [B,H,W,C], MASK [B,H,W]; returns IMAGE [B,H,W,4].
+#
+# Drop this alongside your nodes; category and naming match your mask section.
+
+
+
+
+class MaskCompositeJoinExact:
+    """
+    Merges:
+      ImageCompositeMasked  (destination + source + mask [+ x,y or resize_source])
+      MaskFix               (morphology + smoothing)
+      Join Image with Alpha (alpha = 1 - resized_fixed_mask)
+
+    Input mask should be the same one you fed into ImageCompositeMasked previously
+    (i.e., the *inverted* mask in your screenshot). Output is identical to the
+    three-node chain.
+    """
+
+    CATEGORY = "essentials/mask"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "destination": ("IMAGE",),
+                "source": ("IMAGE",),
+                "mask": ("MASK",),  # this is the same mask you previously sent to ImageCompositeMasked (already inverted upstream)
+                "x": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "y": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 1}),
+                "resize_source": ("BOOLEAN", {"default": False}),
+                # MaskFix params
+                "erode_dilate": ("INT", {"default": 0, "min": -256, "max": 256, "step": 1}),
+                "fill_holes": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
+                "remove_isolated_pixels": ("INT", {"default": 0, "min": 0, "max": 32, "step": 1}),
+                "smooth": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1}),
+                "blur": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1}),
+            }
+        }
+
+    # ---- mask-fix identical ordering ----
+    def _fix_mask(self, mask_bhw, erode_dilate, fill_holes, remove_isolated_pixels, smooth, blur):
+        m = mask_bhw.unsqueeze(1).float().clamp(0, 1)  # [B,1,H,W] in [0,1]
+
+        # 1) erode/dilate
+        if erode_dilate != 0:
+            k = abs(int(erode_dilate))
+            m = _erode(m, k) if erode_dilate < 0 else _dilate(m, k)
+
+        # 2) fill holes (grey_closing ~ dilate then erode)
+        if fill_holes > 0:
+            k = int(fill_holes)
+            m = _dilate(m, k)
+            m = _erode(m, k)
+
+        # 3) remove isolated pixels (grey_opening ~ erode then dilate)
+        if remove_isolated_pixels > 0:
+            k = int(remove_isolated_pixels)
+            m = _erode(m, k)
+            m = _dilate(m, k)
+
+        # 4) smooth after binarize (>0.5) with gaussian_blur
+        if smooth > 0:
+            k = _odd(int(smooth))
+            mb = (m > 0.5).float()
+            m = _gaussian_blur_2d(mb, k)
+
+        # 5) blur on float mask
+        if blur > 0:
+            k = _odd(int(blur))
+            m = _gaussian_blur_2d(m, k)
+
+        return m.clamp(0, 1)  # [B,1,H,W]
+
+    # ---- composite identical to ImageCompositeMasked semantics ----
+    def _composite_pass(self, dest_bchw, src_bchw, mask_b1hw, x, y, resize_source):
+        B, C, H, W = dest_bchw.shape
+
+        # Only RGB in composite (original Join ignored any existing alpha in image)
+        dest_rgb = dest_bchw[:, :3]
+        src_rgb  = src_bchw[:, :3]
+
+        if resize_source:
+            src_r = F.interpolate(src_rgb, size=(H, W), mode="bilinear", align_corners=False)
+            m_r   = _resize_mask_to(mask_b1hw, (H, W))
+            out_rgb = src_r * m_r + dest_rgb * (1.0 - m_r)
+            return out_rgb, m_r
+
+        # paste at (x,y) with clipping
+        out_rgb = dest_rgb.clone()
+        full_m  = torch.zeros((B, 1, H, W), device=dest_rgb.device, dtype=dest_rgb.dtype)
+
+        _, _, h, w = src_rgb.shape
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(W, x0 + w), min(H, y0 + h)
+        if x1 <= x0 or y1 <= y0:
+            return out_rgb, full_m
+
+        sx0 = max(0, -int(x))
+        sy0 = max(0, -int(y))
+
+        src_crop  = src_rgb[:, :, sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)]
+        mask_crop = mask_b1hw[:, :, sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)].clamp(0, 1)
+
+        out_rgb[:, :, y0:y1, x0:x1] = src_crop * mask_crop + out_rgb[:, :, y0:y1, x0:x1] * (1.0 - mask_crop)
+        full_m[:, :, y0:y1, x0:x1]  = mask_crop
+        return out_rgb, full_m
+
+    def execute(self,
+                destination, source, mask,
+                x, y, resize_source,
+                erode_dilate, fill_holes, remove_isolated_pixels, smooth, blur):
+
+        device = destination.device
+        dtype  = destination.dtype
+
+        dest_bchw = _ensure_bchw(destination).to(device=device, dtype=dtype)  # [B,C,H,W]
+        src_bchw  = _ensure_bchw(source).to(device=device, dtype=dtype)       # [B,C,h,w]
+        mask_bhw  = _ensure_bhw(mask).to(device=device, dtype=dtype)          # [B,Hm,Wm]
+
+        # --- FIRST: composite using the *incoming* mask (this matches ImageCompositeMasked) ---
+        # Important: mask here is exactly what your graph fed after InvertMask.
+        raw_mask_b1hw = mask_bhw.unsqueeze(1)
+        comp_rgb_bchw, mask_at_dest_b1hw = self._composite_pass(dest_bchw, src_bchw, raw_mask_b1hw, x, y, resize_source)
+
+        # --- THEN: run MaskFix on the *same* incoming mask (like your separate MaskFix node) ---
+        fixed_mask_b1hw = self._fix_mask(mask_bhw, erode_dilate, fill_holes, remove_isolated_pixels, smooth, blur)
+
+        # Resize fixed mask to the composited image size (destination size), like Join node does,
+        # and invert it for alpha: alpha = 1 - resized_mask
+        H, W = comp_rgb_bchw.shape[-2:]
+        fixed_resized_b1hw = _resize_mask_to(fixed_mask_b1hw, (H, W))
+        alpha_b1hw = (1.0 - fixed_resized_b1hw).clamp(0, 1)
+
+        # Build RGBA from composited RGB + alpha (JoinImageWithAlpha used RGB only)
+        rgba = torch.cat([comp_rgb_bchw, alpha_b1hw], dim=1).movedim(1, -1).contiguous()  # [B,H,W,4]
+
+        return (rgba,)
+
+
+
+def _png_inject_text_chunks(png_bytes: bytes, kv: Dict[str, str]) -> bytes:
+    """
+    Insert PNG tEXt chunks (key -> value) right after IHDR chunk.
+    This keeps color data untouched and avoids PIL.
+    """
+    if not kv:
+        return png_bytes
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    if not png_bytes.startswith(sig):
+        return png_bytes  # not PNG, bail gracefully
+
+    # Walk chunks to find end of IHDR
+    i = len(sig)
+    # First chunk must be IHDR
+    if i + 8 > len(png_bytes):
+        return png_bytes
+    ihdr_len = struct.unpack(">I", png_bytes[i:i+4])[0]
+    ihdr_type = png_bytes[i+4:i+8]
+    if ihdr_type != b'IHDR':
+        return png_bytes
+    ihdr_end = i + 8 + ihdr_len + 4  # len+type+data+crc
+
+    # Build tEXt chunks
+    def make_text_chunk(key: str, val: str) -> bytes:
+        # keyword: Latin-1, 1–79 bytes; our keys are short ascii
+        k = key.encode('latin-1', 'ignore')[:79]
+        v = val.encode('latin-1', 'ignore')
+        data = k + b'\x00' + v
+        typ = b'tEXt'
+        length = struct.pack(">I", len(data))
+        crc = struct.pack(">I", zlib.crc32(typ + data) & 0xffffffff)
+        return length + typ + data + crc
+
+    text_chunks = b''.join(make_text_chunk(k, v) for k, v in kv.items())
+
+    # Insert after IHDR
+    return png_bytes[:ihdr_end] + text_chunks + png_bytes[ihdr_end:]
+
+
+def _prepare_png_bytes_from_tensor(
+    t: torch.Tensor,
+    compress_level: int,
+    metadata: Dict[str, str] | None
+) -> bytes:
+    """
+    t: [H,W,C] float [0,1] on any device; C=3 or 4.
+    Returns PNG bytes with optional tEXt metadata (no PIL).
+    """
+    # To uint8 (one pass)
+    # Ensure contiguous HWC before to(), then .cpu()
+    if t.dim() != 3:
+        raise ValueError("Each image tensor must be [H,W,C]")
+    if t.dtype != torch.uint8:
+        t = (t.clamp(0, 1).mul(255.0).add_(0.5)).to(torch.uint8)
+    t = t.contiguous().cpu()
+
+    np_img = t.numpy()  # shares memory; already uint8
+    h, w, c = np_img.shape
+    if c == 3:
+        # OpenCV expects BGR ordering for most ops; for writing PNG, it will dump as-is.
+        # Viewers expect RGB, so convert from RGB->BGR to match OpenCV's expectation
+        np_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+    elif c == 4:
+        np_img = cv2.cvtColor(np_img, cv2.COLOR_RGBA2BGRA)
+    else:
+        raise ValueError("Images must have 3 (RGB) or 4 (RGBA) channels")
+
+    # Encode to PNG memory buffer
+    # IMWRITE_PNG_COMPRESSION: 0 (fast/large) .. 9 (slow/small)
+    ok, buf = cv2.imencode(
+        ".png",
+        np_img,
+        [cv2.IMWRITE_PNG_COMPRESSION, int(max(0, min(9, compress_level)))]
+    )
+    if not ok:
+        raise RuntimeError("cv2.imencode failed")
+    png_bytes = buf.tobytes()
+
+    # Inject PNG metadata if provided
+    if metadata:
+        png_bytes = _png_inject_text_chunks(png_bytes, metadata)
+
+    return png_bytes
+
+
+class SaveImagePlus:
+    """
+    Threaded, PIL-free SaveImage.
+    - Parallel saving via ThreadPoolExecutor
+    - Fast tensor->PNG using OpenCV
+    - Optional PNG tEXt metadata injection (prompt + extra_pnginfo)
+    """
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
+        self.compress_level = 4  # 0..9
+        self.num_threads = min(8, os.cpu_count() or 4)
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE", {"tooltip": "The images to save."}),
+                "filename_prefix": ("STRING", {
+                    "default": "ComfyUI",
+                    "tooltip": "The prefix for the file to save. This may include formatting like %date:yyyy-MM-dd% or %Empty Latent Image.width%."
+                }),
+                "num_threads": ("INT", {"default": min(8, os.cpu_count() or 4), "min": 1, "max": 64, "step": 1}),
+                "compress_level": ("INT", {"default": 4, "min": 0, "max": 9, "step": 1}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save_images"
+    OUTPUT_NODE = True
+    CATEGORY = "image"
+    DESCRIPTION = "Saves the input images to your ComfyUI output directory (threaded, no PIL)."
+
+    # ------------- helpers -------------
+    def _build_metadata(self, prompt, extra_pnginfo) -> Dict[str, str]:
+        if args.disable_metadata:
+            return {}
+        md: Dict[str, str] = {}
+        if prompt is not None:
+            md["prompt"] = json.dumps(prompt)
+        if extra_pnginfo is not None:
+            for k in extra_pnginfo:
+                md[k] = json.dumps(extra_pnginfo[k])
+        return md
+
+    # worker for thread pool
+    def _write_one(
+        self,
+        image_tensor: torch.Tensor,
+        out_path: str,
+        compress_level: int,
+        metadata: Dict[str, str]
+    ) -> Tuple[str, str, str]:
+        png_bytes = _prepare_png_bytes_from_tensor(image_tensor, compress_level, metadata)
+        # Write atomically
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(png_bytes)
+        os.replace(tmp_path, out_path)
+        # return (filename, subfolder, type)
+        return (os.path.basename(out_path), os.path.basename(os.path.dirname(out_path)), self.type)
+
+    # ------------- main API -------------
+    def save_images(self, images, filename_prefix="ComfyUI", num_threads=None, compress_level=None, prompt=None, extra_pnginfo=None):
+        if num_threads is None:
+            num_threads = self.num_threads
+        if compress_level is None:
+            compress_level = self.compress_level
+
+        filename_prefix = (filename_prefix or "ComfyUI") + self.prefix_append
+
+        # Resolve save path and filename template with Comfy's helper
+        H, W = images[0].shape[0], images[0].shape[1]
+        full_output_folder, filename, counter, subfolder, resolved_prefix = folder_paths.get_save_image_path(
+            filename_prefix, self.output_dir, W, H
+        )
+
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        # Build metadata once
+        metadata = self._build_metadata(prompt, extra_pnginfo)
+
+        # Prepare per-image outputs
+        jobs = []
+        results = [None] * len(images)
+
+        with ThreadPoolExecutor(max_workers=int(max(1, num_threads))) as ex:
+            for batch_number, image in enumerate(images):
+                # Defer conversion to worker (parallelize both conversion + encode)
+                filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
+                out_file = f"{filename_with_batch_num}_{counter:05}_.png"
+                out_path = os.path.join(full_output_folder, out_file)
+
+                fut = ex.submit(
+                    self._write_one,
+                    image,  # [H,W,C] float tensor
+                    out_path,
+                    int(compress_level),
+                    metadata
+                )
+                jobs.append((batch_number, fut, out_file))
+                counter += 1
+
+            # Collect in submit order so return UI list matches original order
+            ui_images: List[Dict[str, str]] = []
+            for batch_number, fut, out_file in jobs:
+                fname, subf, typ = fut.result()
+                ui_images.append({"filename": fname, "subfolder": subfolder, "type": self.type})
+
+        return {"ui": {"images": ui_images}}
+
+
 
 # --------------------------- ComfyUI registration ---------------------------
 
 NODE_CLASS_MAPPINGS = {
+    "MaskCompositeJoin": MaskCompositeJoinExact,
+    "MagixSaveImage": SaveImagePlus,
     "AnimeJitter": AnimeJitter,
     "AlphaToSolidBackground": AlphaToSolidBackground,
     "VideoSceneExtractor": VideoSceneExtractor,
@@ -1106,6 +1539,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "MaskCompositeJoin": "Mask Composite Join+",
+    "MagixSaveImage": "Magix Save Image",
     "AnimeJitter": "Anime Jitter",
     "AlphaToSolidBackground": "Alpha → Solid Background",
     "VideoSceneExtractor": "Video Scene Extractor",
